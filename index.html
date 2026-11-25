@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Online-Navi Pro</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="stylesheet" href="https://unpkg.com" />
+    <link rel="stylesheet" href="https://unpkg.com" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: sans-serif; overflow: hidden; background: #121212; }
+        #map { height: 100%; width: 100%; }
+        #controls {
+            position: absolute; top: 10px; left: 10px; right: 10px; z-index: 1000;
+            background: white; padding: 10px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            display: flex; gap: 5px; transition: background 0.3s;
+        }
+        input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
+        button { padding: 8px 14px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        #dark-btn { background: #222; padding: 8px 12px; font-size: 16px; }
+
+        /* Nachtmodus-Styles für Eingabefeld */
+        body.dark-mode #controls { background: #1e1e1e; box-shadow: 0 2px 8px rgba(0,0,0,0.8); }
+        body.dark-mode input { background: #2c2c2c; color: white; border-color: #444; }
+        body.dark-mode #dark-btn { background: #f1c40f; color: #111; }
+        
+        /* Digitaler GPS-Tacho */
+        #speedometer {
+            position: absolute; bottom: 25px; left: 15px; z-index: 1000;
+            background: rgba(20, 20, 20, 0.9); color: #00ff88;
+            padding: 12px 18px; border-radius: 12px; border: 2px solid #444;
+            text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+            min-width: 70px;
+        }
+        #speed-val { font-size: 32px; font-weight: bold; line-height: 1; }
+        #speed-unit { font-size: 12px; color: #ccc; margin-top: 2px; }
+
+        /* Blitzer-Warnbanner */
+        #radar-warning {
+            display: none; position: absolute; bottom: 105px; left: 15px; right: 15px; z-index: 1001;
+            background: #d90429; color: white; padding: 15px; border-radius: 10px;
+            text-align: center; font-size: 20px; font-weight: bold;
+            box-shadow: 0 4px 15px rgba(217, 4, 41, 0.6);
+            animation: blink 1s infinite;
+        }
+        @keyframes blink { 50% { opacity: 0.7; } }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <input type="text" id="destination" placeholder="Zielort (z. B. Kleve)">
+        <button onclick="calculateRoute()">Start</button>
+        <button id="dark-btn" onclick="toggleDarkMode()" title="Nachtmodus umschalten">🌙</button>
+    </div>
+    
+    <div id="radar-warning">⚠️ ACHTUNG BLITZER! (<span id="radar-dist">0</span> m)</div>
+    
+    <div id="speedometer">
+        <div id="speed-val">0</div>
+        <div id="speed-unit">km/h</div>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com"></script>
+    <script src="https://unpkg.com"></script>
+    <script>
+        let map = L.map('map').setView([51.766, 6.183], 13);
+        let userLat, userLon, routingControl, userMarker;
+        let speedCameras = [];
+        let lastFetchLat = 0, lastFetchLon = 0;
+        let lastWarnedId = null;
+        let isDarkMode = false;
+
+        let routeInstructions = [];
+        let routeCoordinates = [];
+        let spokenSteps = new Set();
+
+        // Helle und dunkle Kartenebenen definieren
+        const lightTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        });
+        const darkTiles = L.tileLayer('https://{s}://{z}/{x}/{y}{r}.png', {
+            attribution: '© OpenStreetMap, © CARTO'
+        });
+
+        lightTiles.addTo(map);
+
+        // Nachtmodus umschalten
+        function toggleDarkMode() {
+            isDarkMode = !isDarkMode;
+            const btn = document.getElementById('dark-btn');
+            if (isDarkMode) {
+                map.removeLayer(lightTiles);
+                darkTiles.addTo(map);
+                document.body.classList.add('dark-mode');
+                btn.innerText = '☀️';
+            } else {
+                map.removeLayer(darkTiles);
+                lightTiles.addTo(map);
+                document.body.classList.remove('dark-mode');
+                btn.innerText = '🌙';
+            }
+        }
+
+        const cameraIcon = L.divIcon({
+            html: '<div style="background:red; color:white; border-radius:50%; width:24px; height:24px; text-align:center; line-height:24px; font-weight:bold; border:2px solid white;">📸</div>',
+            className: ''
+        });
+
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+                const msg = new SpeechSynthesisUtterance(text);
+                msg.lang = 'de-DE';
+                window.speechSynthesis.speak(msg);
+            }
+        }
+
+        if (navigator.geolocation) {
+            navigator.geolocation.watchPosition(pos => {
+                userLat = pos.coords.latitude;
+                userLon = pos.coords.longitude;
+
+                const speedMs = pos.coords.speed;
+                const speedKmh = speedMs ? Math.round(speedMs * 3.6) : 0;
+                document.getElementById('speed-val').innerText = speedKmh;
+
+                if (!userMarker) {
+                    userMarker = L.marker([userLat, userLon]).addTo(map).bindPopup("Dein Standort");
+                    map.setView([userLat, userLon], 15);
+                } else {
+                    userMarker.setLatLng([userLat, userLon]);
+                }
+
+                if (getDistance(userLat, userLon, lastFetchLat, lastFetchLon) > 3000) {
+                    fetchSpeedCameras(userLat, userLon);
+                    lastFetchLat = userLat;
+                    lastFetchLon = userLon;
+                }
+
+                checkRadarProximity(userLat, userLon);
+                checkTurnByTurn(userLat, userLon);
+
+            }, err => alert("Bitte GPS aktivieren!"), { enableHighAccuracy: true });
+        }
+
+        function checkTurnByTurn(lat, lon) {
+            if (routeInstructions.length === 0) return;
+
+            routeInstructions.forEach((step, index) => {
+                if (spokenSteps.has(index)) return;
+                
+                const coord = routeCoordinates[step.index];
+                if (!coord) return;
+
+                const dist = getDistance(lat, lon, coord.lat, coord.lng);
+                if (dist <= 60) {
+                    spokenSteps.add(index);
+                    speak(step.text);
+                }
+            });
+        }
+
+        async function fetchSpeedCameras(lat, lon) {
+            const query = `[out:json];node["highway"="speed_camera"](around:5000,${lat},${lon});out;`;
+            const url = `https://overpass-api.de{encodeURIComponent(query)}`;
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                speedCameras = data.elements;
+                speedCameras.forEach(cam => {
+                    L.marker([cam.lat, cam.lon], { icon: cameraIcon })
+                     .addTo(map)
+                     .bindPopup(`Blitzer ${cam.tags.maxspeed ? '(' + cam.tags.maxspeed + ' km/h)' : ''}`);
+                });
+            } catch (e) { console.error("Blitzer-Daten Fehler", e); }
+        }
+
+        function checkRadarProximity(lat, lon) {
+            let closestCam = null;
+            let minDist = Infinity;
+
+            speedCameras.forEach(cam => {
+                const d = getDistance(lat, lon, cam.lat, cam.lon);
+                if (d < minDist) {
+                    minDist = d;
+                    closestCam = cam;
+                }
+            });
+
+            const warningBox = document.getElementById('radar-warning');
+            if (closestCam && minDist <= 300) {
+                warningBox.style.display = 'block';
+                document.getElementById('radar-dist').innerText = Math.round(minDist);
+                
+                if (lastWarnedId !== closestCam.id) {
+                    lastWarnedId = closestCam.id;
+                    triggerAlarm(closestCam.tags.maxspeed);
+                }
+            } else {
+                warningBox.style.display = 'none';
+                if (minDist > 400) lastWarnedId = null;
+            }
+        }
+
+        function triggerAlarm(maxspeed) {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(880, ctx.currentTime);
+            osc.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.4);
+
+            const text = maxspeed ? `Achtung Blitzer! Erlaubt sind ${maxspeed} Stundenkilometer.` : "Achtung Blitzer voraus!";
+            speak(text);
+        }
+
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371e3;
+            const p1 = lat1 * Math.PI/180, p2 = lat2 * Math.PI/180;
+            const dp = (lat2-lat1) * Math.PI/180, dl = (lon2-lon1) * Math.PI/180;
+            const a = Math.sin(dp/2)*Math.sin(dp/2) + Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)*Math.sin(dl/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        async function calculateRoute() {
+            const dest = document.getElementById('destination').value;
+            if (!dest || !userLat) return alert("Bitte Ziel eingeben und auf GPS-Signal warten.");
+
